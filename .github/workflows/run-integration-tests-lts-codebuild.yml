@@ -4,6 +4,8 @@ on: [push]
 
 jobs:
   codebuild:
-    runs-on: codebuild-jdbcWrapper-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: codebuild-testWrapper-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - run: echo "Hello World!"
+      - run: echo "Hello World! ${{ env.TEST_VAR }}"
+        env:
+          TEST_VAR: "345"
