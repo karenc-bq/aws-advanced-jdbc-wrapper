@@ -47,7 +47,7 @@ public class HostSpec {
   protected Timestamp lastUpdateTime;
   protected HostAvailabilityStrategy hostAvailabilityStrategy;
 
-  private HostSpec(
+  public HostSpec(
       final String host,
       final int port,
       final String hostId,

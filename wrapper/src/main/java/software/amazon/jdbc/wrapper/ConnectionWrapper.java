@@ -16,14 +16,18 @@
 
 package software.amazon.jdbc.wrapper;
 
+import com.sun.jna.*;
+import java.nio.ByteBuffer;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.CallableStatement;
 import java.sql.Clob;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
 import java.sql.NClob;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLClientInfoException;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
@@ -33,6 +37,7 @@ import java.sql.Statement;
 import java.sql.Struct;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -42,12 +47,16 @@ import software.amazon.jdbc.ConnectionPluginManager;
 import software.amazon.jdbc.ConnectionProvider;
 import software.amazon.jdbc.HostListProvider;
 import software.amazon.jdbc.HostListProviderService;
+import software.amazon.jdbc.HostRole;
+import software.amazon.jdbc.HostSpec;
 import software.amazon.jdbc.PluginManagerService;
 import software.amazon.jdbc.PluginService;
 import software.amazon.jdbc.PluginServiceImpl;
 import software.amazon.jdbc.PropertyDefinition;
 import software.amazon.jdbc.cleanup.CanReleaseResources;
 import software.amazon.jdbc.dialect.HostListProviderSupplier;
+import software.amazon.jdbc.hostavailability.HostAvailability;
+import software.amazon.jdbc.hostavailability.SimpleHostAvailabilityStrategy;
 import software.amazon.jdbc.profile.ConfigurationProfile;
 import software.amazon.jdbc.targetdriverdialect.TargetDriverDialect;
 import software.amazon.jdbc.util.ConnectionUrlParser;
@@ -74,6 +83,111 @@ public class ConnectionWrapper implements Connection, CanReleaseResources {
   protected @Nullable Throwable openConnectionStacktrace;
 
   protected final ConnectionUrlParser connectionUrlParser = new ConnectionUrlParser();
+
+  /*
+   * COMMON LIBRARY
+   */
+
+  private static final Map<Pointer, Connection> CONNECTION_MAP = new ConcurrentHashMap<>();
+  private static CommonLibrary library;
+
+  interface CommonLibrary extends Library {
+
+    CommonLibrary INSTANCE = Native.load("cpoc", CommonLibrary.class);
+
+    void SetConnectCallback(ConnectCallback func_ptr);
+
+    void SetQueryTopologyCallback(QueryCallback func_ptr);
+
+    void CreateCallbackManager();
+
+    void CleanUpCallbackManager();
+
+    Pointer CreateRdsHostListProvider();
+
+    void DeleteRdsHostListProvider(Pointer provider);
+
+    void QueryTopology(Pointer rdsHostListProvider, Pointer connectionPtr);
+
+    void CreateHostInfo(Pointer rdsHostListProvider, String host);
+
+    String GenerateConnectAuthToken(String db_hostname, String db_user);
+
+    interface QueryCallback extends Callback {
+
+      void invoke(Pointer connectionPtr, Pointer rdsHostListProvider);
+    }
+
+    class QueryCallbackImpl implements QueryCallback {
+
+      @Override
+      public void invoke(Pointer connectionPtr, Pointer rdsHostListProvider) {
+        System.out.println("calling query invoke with connectionPtr: " + connectionPtr);
+        Connection conn = toConnection(connectionPtr);
+
+        try (final Statement stmt = conn.createStatement();
+            final ResultSet resultSet = stmt.executeQuery("SELECT SERVER_ID FROM aurora_replica_status()")) {
+          while (resultSet.next()) {
+            library.CreateHostInfo(rdsHostListProvider, resultSet.getString(1));
+          }
+        } catch (Exception e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+
+    interface ConnectCallback extends Callback {
+
+      Pointer invoke(String host, String user, String token);
+    }
+
+    class ConnectCallbackImpl implements ConnectCallback {
+
+      @Override
+      public Pointer invoke(String host, String user, String token) {
+        System.out.println("calling invoke with token: " + token);
+
+        // Option 1: high level
+
+        final Properties properties = new Properties();
+
+        // Configuring connection properties for the underlying JDBC driver.
+        properties.setProperty("user", "jane_doe");
+        properties.setProperty("password", token);
+
+        try {
+          Connection conn = DriverManager.getConnection(
+              "jdbc:postgresql://foo.com:5432/postgres",
+              properties);
+          // Statement stmt = conn.createStatement();
+          // ResultSet rs = stmt.executeQuery("SELECT aurora_db_instance_identifier()");
+          // rs.next();
+          // System.out.println(rs.getString(1));
+          return toPointer(conn);
+        } catch (SQLException e) {
+          throw new RuntimeException(e);
+        }
+
+        //
+        // try {
+        //   Connection conn = DriverManager
+        //       .getDriver("jdbc:postgresql://database-pg.cluster-cwpu2jclcwdc.us-east-2.rds.amazonaws.com:5432/postgres")
+        //       .connect("jdbc:postgresql://database-pg.cluster-cwpu2jclcwdc.us-east-2.rds.amazonaws.com:5432/postgres", properties);
+        //   return toPointer(conn);
+        // } catch (SQLException e) {
+        //   throw new RuntimeException(e);
+        // }
+      }
+    }
+
+    Pointer ConnectIam(String db_hostname, String db_user);
+
+    int GetTwo();
+  }
+
+  /*
+   * COMMON LIBRARY
+   */
 
   public ConnectionWrapper(
       @NonNull final Properties props,
@@ -135,11 +249,24 @@ public class ConnectionWrapper implements Connection, CanReleaseResources {
       final PluginService pluginService,
       final HostListProviderService hostListProviderService,
       final PluginManagerService pluginManagerService) throws SQLException {
+
+    library = CommonLibrary.INSTANCE;
+    Pointer rdsHostListProvider = library.CreateRdsHostListProvider();
+
+    library.CreateCallbackManager();
+    library.SetConnectCallback(new CommonLibrary.ConnectCallbackImpl());
+    library.SetQueryTopologyCallback(new CommonLibrary.QueryCallbackImpl());
+
     this.pluginManager = connectionPluginManager;
     this.telemetryFactory = telemetryFactory;
     this.pluginService = pluginService;
     this.hostListProviderService = hostListProviderService;
     this.pluginManagerService = pluginManagerService;
+
+    // Pointer pluginManager = library.CreatePluginManager();
+    // Pointer pluginService = library.CreatePluginService();
+    //
+    // library.Init(pluginManager, pluginService);
 
     this.pluginManager.init(
         this.pluginService, props, pluginManagerService, this.configurationProfile);
@@ -169,9 +296,15 @@ public class ConnectionWrapper implements Connection, CanReleaseResources {
         throw new SQLException(Messages.get("ConnectionWrapper.connectionNotOpen"), SqlState.UNKNOWN_STATE.getState());
       }
 
-      this.pluginService.setCurrentConnection(conn, this.pluginService.getInitialConnectionHostSpec());
-      this.pluginService.refreshHostList();
+      //   this.pluginService.setCurrentConnection(conn, this.pluginService.getInitialConnectionHostSpec());
+      //   this.pluginService.refreshHostList();
     }
+
+    Pointer connection = library.ConnectIam("foo.com", "foo");
+    pluginService.setCurrentConnection(toConnection(connection),
+        new HostSpec("blah", 1234, "blah", HostRole.WRITER, HostAvailability.AVAILABLE,
+            new SimpleHostAvailabilityStrategy()));
+    library.QueryTopology(rdsHostListProvider, connection);
   }
 
   public void releaseResources() {
@@ -208,25 +341,25 @@ public class ConnectionWrapper implements Connection, CanReleaseResources {
 
   @Override
   public void close() throws SQLException {
-    WrapperUtils.runWithPlugins(
-        SQLException.class,
-        this.pluginManager,
-        this.pluginService.getCurrentConnection(),
-        "Connection.close",
-        () -> {
-          this.pluginService.getSessionStateService().begin();
-          try {
-            this.pluginService.getSessionStateService().applyPristineSessionState(
-                this.pluginService.getCurrentConnection());
-            this.pluginService.getCurrentConnection().close();
-          } finally {
-            this.pluginService.getSessionStateService().complete();
-            this.pluginService.getSessionStateService().reset();
-          }
-          this.openConnectionStacktrace = null;
-          this.pluginManagerService.setInTransaction(false);
-        });
-    this.releaseResources();
+    // WrapperUtils.runWithPlugins(
+    //     SQLException.class,
+    //     this.pluginManager,
+    //     this.pluginService.getCurrentConnection(),
+    //     "Connection.close",
+    //     () -> {
+    //       this.pluginService.getSessionStateService().begin();
+    //       try {
+    //         this.pluginService.getSessionStateService().applyPristineSessionState(
+    //             this.pluginService.getCurrentConnection());
+    //         this.pluginService.getCurrentConnection().close();
+    //       } finally {
+    //         this.pluginService.getSessionStateService().complete();
+    //         this.pluginService.getSessionStateService().reset();
+    //       }
+    //       this.openConnectionStacktrace = null;
+    //       this.pluginManagerService.setInTransaction(false);
+    //     });
+    // this.releaseResources();
   }
 
   @Override
@@ -341,8 +474,8 @@ public class ConnectionWrapper implements Connection, CanReleaseResources {
         this.pluginService.getCurrentConnection(),
         "Connection.createStatement",
         () -> this.pluginService
-          .getCurrentConnection()
-          .createStatement(resultSetType, resultSetConcurrency, resultSetHoldability),
+            .getCurrentConnection()
+            .createStatement(resultSetType, resultSetConcurrency, resultSetHoldability),
         resultSetType,
         resultSetConcurrency,
         resultSetHoldability);
@@ -964,4 +1097,18 @@ public class ConnectionWrapper implements Connection, CanReleaseResources {
       super.finalize();
     }
   }
+
+  private static Pointer toPointer(Connection conn) {
+    // Return Connection to C library via pointer to memory buffer.
+    ByteBuffer buffer = ByteBuffer.allocateDirect(8);
+    buffer.putLong(0, System.identityHashCode(conn));
+    final Pointer pt = Native.getDirectBufferPointer(buffer);
+    CONNECTION_MAP.put(pt, conn);
+    return pt;
+  }
+
+  private static Connection toConnection(Pointer pt) {
+    return CONNECTION_MAP.get(pt);
+  }
+
 }
